@@ -1,23 +1,52 @@
 
 from django.db import transaction
-from django.shortcuts import get_object_or_404
+from django.shortcuts import get_object_or_404, redirect
+
 from rest_framework import generics, status
 from rest_framework.response import Response
-from rest_framework.views import APIView
 
 from .models import Event, Registration
 from .serializers import EventSerializer, RegistrationSerializer
 
 
+# ------------------------------------------
+# EVENT LIST AND CREATE
+# ------------------------------------------
+
 class EventListCreateView(generics.ListCreateAPIView):
     queryset = Event.objects.all().order_by("date")
     serializer_class = EventSerializer
 
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+
+        # Reset the event form after successful browser submission.
+        if request.accepted_renderer.format == "api":
+            return redirect("/api/events/")
+
+        headers = self.get_success_headers(serializer.data)
+
+        return Response(
+            serializer.data,
+            status=status.HTTP_201_CREATED,
+            headers=headers,
+        )
+
+
+# ------------------------------------------
+# EVENT DETAILS, UPDATE AND DELETE
+# ------------------------------------------
 
 class EventDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Event.objects.all()
     serializer_class = EventSerializer
 
+
+# ------------------------------------------
+# REGISTRATION LIST AND CREATE
+# ------------------------------------------
 
 class RegistrationListCreateView(generics.ListCreateAPIView):
     queryset = Registration.objects.select_related("event").all()
@@ -25,12 +54,25 @@ class RegistrationListCreateView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         queryset = Registration.objects.select_related("event").all()
-        event_id = self.request.GET.get("event")
+
+        event_id = self.request.query_params.get("event")
 
         if event_id:
             queryset = queryset.filter(event_id=event_id)
 
         return queryset.order_by("-registered_at")
+
+    def get_serializer(self, *args, **kwargs):
+        serializer = super().get_serializer(*args, **kwargs)
+
+        # Keep the previously selected event in the fresh form.
+        if self.request.method == "GET":
+            event_id = self.request.query_params.get("event")
+
+            if event_id:
+                serializer.fields["event"].initial = event_id
+
+        return serializer
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
@@ -50,14 +92,20 @@ class RegistrationListCreateView(generics.ListCreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        # Check event capacity.
         if event.registrations.count() >= event.capacity:
             return Response(
-                {"error": "This event has reached its maximum capacity."},
+                {
+                    "error": (
+                        "This event has reached its maximum capacity."
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         email = serializer.validated_data["attendee_email"]
 
+        # Prevent duplicate registrations for the same event.
         if event.registrations.filter(
             attendee_email__iexact=email
         ).exists():
@@ -72,15 +120,23 @@ class RegistrationListCreateView(generics.ListCreateAPIView):
 
         self.perform_create(serializer)
 
+        # Return to the same event's registration form.
+        # Attendee name and email will be cleared.
+        if request.accepted_renderer.format == "api":
+            return redirect(
+                f"/api/registrations/?event={event.pk}"
+            )
+
         return Response(
             serializer.data,
             status=status.HTTP_201_CREATED,
         )
 
 
-class RegistrationCancelView(APIView):
-    def delete(self, request, pk):
-        registration = get_object_or_404(Registration, pk=pk)
-        registration.delete()
+# ------------------------------------------
+# REGISTRATION DETAILS AND CANCELLATION
+# ------------------------------------------
 
-        return Response(status=status.HTTP_204_NO_CONTENT)
+class RegistrationCancelView(generics.RetrieveDestroyAPIView):
+    queryset = Registration.objects.select_related("event").all()
+    serializer_class = RegistrationSerializer
